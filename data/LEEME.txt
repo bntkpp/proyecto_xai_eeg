@@ -1,0 +1,2 @@
+Pon aqui tus archivos .fif descargados del Drive,
+por ejemplo: sub-069_ses-5_task-95ByBP_eeg_clean-epo.fif
