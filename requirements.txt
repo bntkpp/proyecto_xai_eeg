@@ -1,0 +1,8 @@
+# Hito 4 / Actividad 3 — XAI y Mapeo Cerebral
+# Instala con:  pip install -r requirements.txt
+torch>=2.0
+captum>=0.6.0
+mne>=1.5.0
+streamlit>=1.30
+numpy>=1.24
+matplotlib>=3.7
