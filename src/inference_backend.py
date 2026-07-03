@@ -41,6 +41,39 @@ N_SAMPLES  = 375        # muestras de tiempo esperadas (verifícalo con leer_can
 SFREQ      = 250        # Hz
 IG_STEPS   = 50         # pasos de Integrated Gradients (baja a ~25 si necesitas velocidad)
 
+# --------------------------------------------------------------------
+# NORMALIZACIÓN DE ENTRADA  (CRÍTICO — ver nota)
+# --------------------------------------------------------------------
+# El modelo NO se entrenó con Voltios crudos. Si se le pasan datos en
+# Voltios (~1e-6) sin escalar, SATURA y predice SIEMPRE la clase 0
+# ("Sin Dolor"): la app daría una constante sin sentido.
+#
+# EEG_SCALE se RECUPERÓ por forense del propio .pth: la varianza guardada
+# en `temporal_conv.1.running_var` (BatchNorm) implica que el entrenamiento
+# escaló la entrada por ~8.7e4 (equivale a dividir por un std de dataset
+# ~11 µV; deja la salida de BN1 en media≈0, var≈1). Es PROVISIONAL: hay
+# ~±15% de incertidumbre en la constante exacta porque estos sujetos no son
+# idénticos a los de entrenamiento. Si algún día aparece el script de
+# entrenamiento, sustituye esto por su normalización exacta.
+EEG_SCALE = 8.7e4
+# Umbral para decidir si un tensor ya viene normalizado (.npy/.pt) o en
+# Voltios crudos: si su magnitud máxima es < este valor, asumimos Voltios.
+_RAW_VOLT_MAXABS = 1e-2
+
+# --------------------------------------------------------------------
+# CALIBRACIÓN DE CONFIANZA  (temperature scaling)
+# --------------------------------------------------------------------
+# El % de confianza de un softmax crudo no es una probabilidad honesta.
+# CONF_TEMPERATURE se ajustó minimizando NLL sobre una mitad de los sujetos
+# y se validó en la otra mitad (sin solapamiento). NO cambia la clase
+# predicha (T es un escalar), solo el % mostrado.
+#
+# Hallazgo: el modelo YA estaba bien calibrado a nivel global (ECE ~3.5%,
+# T≈0.90), así que el ajuste es pequeño. OJO: las confianzas ALTAS (>55%)
+# están algo SOBREESTIMADAS (dice ~81% y acierta ~72%); un único T no corrige
+# eso del todo. Para uso clínico, leer una confianza alta con cautela.
+CONF_TEMPERATURE = 0.903
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 MAPA_DOLOR = {
@@ -71,6 +104,10 @@ assert len(CH_NAMES) == N_CHANNELS, f"CH_NAMES tiene {len(CH_NAMES)}, deben ser 
 # Grupos por región (POR NOMBRE de electrodo). Ver tabla del plan, sección 4.
 CENTRAL_SOMATOSENSORY = {"C5", "C3", "C1", "Cz", "C2", "C4", "C6",
                          "FCz", "CP1", "CPz", "CP2"}
+# Canales OCULARES de verdad (electrodos EOG). Si el modelo se apoya en
+# estos, la predicción se basa en los OJOS, no en el cerebro: es el caso
+# más grave y debe alertarse explícitamente.
+EOG_CHANNELS          = {"VEO", "HEO", "HEOR", "HEOL", "VEOU", "VEOL", "EOG"}
 FRONTAL_OCULAR        = {"Fp1", "Fpz", "Fp2", "AF7", "AF3", "AFz", "AF4", "AF8"}
 TEMPORAL_MUSCLE       = {"T7", "T8", "FT7", "FT8", "TP7", "TP8", "TP9", "TP10"}
 
@@ -182,11 +219,24 @@ def build_info(sfreq=SFREQ):
 # ====================================================================
 # UTILIDADES
 # ====================================================================
+def _normalizar(tensor_eeg):
+    """Escala la entrada a la magnitud que el modelo espera (ver EEG_SCALE).
+
+    Solo escala si el tensor parece estar en Voltios crudos (magnitud máxima
+    < _RAW_VOLT_MAXABS). Así un .npy/.pt que ya venga normalizado no se
+    re-escala por error. Devuelve el tensor escalado.
+    """
+    if float(tensor_eeg.abs().max()) < _RAW_VOLT_MAXABS:
+        tensor_eeg = tensor_eeg * EEG_SCALE
+    return tensor_eeg
+
+
 def _prep_input(tensor_eeg):
     """Lleva el tensor a (1, 1, 63, T). Acepta (63,T), (1,63,T), (1,1,63,T)."""
     if not torch.is_tensor(tensor_eeg):
         tensor_eeg = torch.as_tensor(tensor_eeg, dtype=torch.float32)
     tensor_eeg = tensor_eeg.float()
+    tensor_eeg = _normalizar(tensor_eeg)
     if tensor_eeg.dim() == 2:
         tensor_eeg = tensor_eeg.unsqueeze(0).unsqueeze(0)
     elif tensor_eeg.dim() == 3:
@@ -208,6 +258,11 @@ def _prep_input(tensor_eeg):
 def _texto_clinico(pesos_63, ch_names):
     idx_max = int(np.argmax(pesos_63))
     ch = ch_names[idx_max]
+    if ch in EOG_CHANNELS:
+        return (f"⚠️ ALERTA: el electrodo dominante es {ch}, un canal OCULAR (EOG). "
+                f"La predicción se está apoyando en actividad de los ojos "
+                f"(parpadeo/movimiento), NO en la corteza cerebral. "
+                f"Resultado clínicamente NO fiable para esta época.")
     if ch in CENTRAL_SOMATOSENSORY:
         return (f"Activación somatosensorial en {ch} (córtex central). "
                 f"Patrón fisiológico válido de procesamiento del dolor.")
@@ -237,8 +292,8 @@ def procesar_onda_eeg(tensor_eeg, model_cargado, ch_names=None):
     # 1) PREDICCIÓN (sin gradientes)
     with torch.no_grad():
         logits = model_cargado(x)
-        probs = torch.softmax(logits, dim=1)
-        clase = int(logits.argmax(dim=1).item())
+        clase = int(logits.argmax(dim=1).item())          # argmax no depende de T
+        probs = torch.softmax(logits / CONF_TEMPERATURE, dim=1)   # confianza calibrada
         confianza = float(probs[0, clase].item())
     nivel_dolor = MAPA_DOLOR.get(clase, "Desconocido")
 
