@@ -279,6 +279,21 @@ def _texto_clinico(pesos_63, ch_names):
 # ====================================================================
 # FUNCIÓN PRINCIPAL DEL BACKEND
 # ====================================================================
+def predecir_proba_cerebro(tensor_eeg, model_cargado):
+    """Devuelve el vector softmax COMPLETO de las 4 clases NRS (soft output).
+
+    Lo necesita la capa de fusión multimodal (Hito V): la fusión combina las
+    distribuciones de probabilidad de ambos modelos, no solo la clase final.
+    Aplica la misma normalización y temperatura de calibración que la app.
+
+    Retorna: np.ndarray de forma (4,) que suma 1.
+    """
+    x = _prep_input(tensor_eeg).to(DEVICE)
+    with torch.no_grad():
+        probs = torch.softmax(model_cargado(x) / CONF_TEMPERATURE, dim=1)
+    return probs.cpu().numpy().reshape(-1)
+
+
 def procesar_onda_eeg(tensor_eeg, model_cargado, ch_names=None):
     """
     Recibe: tensor EEG (63,T)/(1,1,63,T), el modelo ya cargado, y opcionalmente
