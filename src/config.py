@@ -106,6 +106,17 @@ NRS_POR_CLASE_BIOVID = np.array([0.0, 2.5, 5.0, 7.5, 10.0])
 BODY_META_COLS = ["subject_id", "subject_name", "class_id", "class_name",
                   "sample_id", "sample_name"]
 
+# --------------------------------------------------------------------
+# COHERENCIA NEUROFISIOLÓGICA (Hito XAI 1.4)
+# --------------------------------------------------------------------
+# Ventanas de referencia de componentes evocados relacionados con dolor
+# (literatura: N2 y P300/P3 evocados por estímulos nociceptivos).
+N2_WINDOW_MS = (200, 350)
+P300_WINDOW_MS = (250, 500)
+# Banda gamma asociada a sincronización cortical durante procesamiento
+# nociceptivo (Zhang et al., Gross et al. — literatura EEG de dolor).
+GAMMA_BAND_HZ = (30.0, 80.0)
+
 # Mapea la etiqueta de evento real del .fif (protocolo de estimulación)
 # a la clase BioVid correspondiente (0=BL1 sin dolor ... 4=PA4 extremo).
 # Confirmado con el usuario: NRS_2/4/6/8 = PA1/PA2/PA3/PA4.

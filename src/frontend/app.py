@@ -36,7 +36,7 @@ import streamlit as st
 import torch
 
 from src import config
-from src.backend import body_engine, eeg_engine
+from src.backend import body_engine, coherencia_engine, eeg_engine
 from src.frontend import resources, session, ui_components
 
 mne.set_log_level("ERROR")
@@ -407,6 +407,68 @@ if lime_eeg is not None:
         st.caption("Eje X en milisegundos desde el inicio de la época.")
 else:
     st.caption("Presiona el botón para calcularlo.")
+
+# ====================================================================
+# COHERENCIA NEUROFISIOLÓGICA (Fase 1.4)
+# ====================================================================
+st.markdown("---")
+st.markdown("### 🔬 Coherencia neurofisiológica")
+st.caption("Contrasta las 4 explicaciones XAI contra la literatura del dolor: componentes "
+          f"N2 ({config.N2_WINDOW_MS[0]}-{config.N2_WINDOW_MS[1]}ms) / "
+          f"P300 ({config.P300_WINDOW_MS[0]}-{config.P300_WINDOW_MS[1]}ms) y sincronización "
+          f"gamma ({config.GAMMA_BAND_HZ[0]:.0f}-{config.GAMMA_BAND_HZ[1]:.0f}Hz), típicamente "
+          "con topografía centro-parietal. Esto NO valida que el modelo 'acierte' — valida que "
+          "sus explicaciones sean fisiológicamente plausibles y no artefactos.")
+
+xai_listo = session.get_resultado_cacheado("xai_ext_eeg", idx)
+lime_listo = session.get_resultado_cacheado("lime_eeg", idx)
+
+if xai_listo is None or lime_listo is None:
+    st.info("Calcula primero **SHAP + Grad-CAM** y **LIME-EEG** arriba (en esta misma época) "
+            "para poder comparar los 4 métodos entre sí.")
+else:
+    if st.button("Evaluar coherencia neurofisiológica"):
+        with st.spinner("Calculando potencia gamma real y contrastando los 4 métodos..."):
+            coherencia = coherencia_engine.evaluar_coherencia(
+                tensor_eeg=tensor, ch_names=ch_names,
+                resultado_eeg=resultado, xai_ext=xai_listo, lime_eeg=lime_listo,
+            )
+        session.set_resultado_cacheado("coherencia", idx, coherencia)
+
+    coherencia = session.get_resultado_cacheado("coherencia", idx)
+    if coherencia is not None:
+        st.info(coherencia.resumen_texto)
+
+        coh1, coh2 = st.columns(2)
+        with coh1:
+            st.caption("**Canal pico por método** — ¿cae en región somatosensorial central?")
+            df_region = pd.DataFrame({
+                "Electrodo pico": coherencia.canal_pico_por_metodo,
+                "¿Consistente?": {m: ("✅" if ok else "❌")
+                                 for m, ok in coherencia.region_consistente_por_metodo.items()},
+            })
+            st.dataframe(df_region, use_container_width=True)
+        with coh2:
+            st.caption("**Ventana temporal pico** — ¿cae en N2/P300?")
+            df_ventana = pd.DataFrame({
+                "Pico (ms)": coherencia.ventana_pico_ms_por_metodo,
+                "¿Consistente?": {m: ("✅" if ok else "❌")
+                                 for m, ok in coherencia.ventana_consistente_por_metodo.items()},
+            })
+            st.dataframe(df_ventana, use_container_width=True)
+
+        st.caption("**Correlación con potencia gamma real** (Spearman ρ, por método — "
+                  "positivo y alto = la explicación coincide con dónde hay más gamma de verdad)")
+        df_gamma = pd.DataFrame({"ρ (Spearman)": coherencia.correlacion_gamma_por_metodo})
+        st.bar_chart(df_gamma, height=220)
+
+        st.caption("**Topografía de potencia gamma real** (30-80Hz, Welch) — compárala "
+                  "visualmente con el topomap de Integrated Gradients de más arriba")
+        st.pyplot(ui_components.dibujar_topomap(coherencia.potencia_gamma_por_canal, info),
+                  use_container_width=True)
+    else:
+        st.caption("Presiona el botón para evaluar la coherencia.")
+
 
 
 # ====================================================================
