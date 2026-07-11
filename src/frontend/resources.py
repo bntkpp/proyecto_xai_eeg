@@ -37,3 +37,11 @@ def get_fuser():
 @st.cache_resource(show_spinner="Leyendo archivo EEG...")
 def get_epochs(path: str):
     return eeg_engine.leer_fif(path)
+
+
+@st.cache_resource(show_spinner="Preparando explicador LIME...")
+def get_lime_explainer():
+    """Se construye UNA sola vez sobre el dataset de fondo completo —
+    reconstruirlo en cada rerun sería lento e innecesario."""
+    predictor = get_body_predictor()
+    return body_engine.crear_explicador_lime(predictor)

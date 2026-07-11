@@ -3,7 +3,8 @@ frontend/app.py
 ====================================================================
 MONITOR INTERACTIVO (Frontend) — Streamlit
 Dashboard médico: nivel de dolor + topomap + explicación clínica +
-Pain Index multimodal (cuerpo + cerebro).
+Pain Index multimodal (cuerpo + cerebro) + historial de sesión con
+reproducción automática de épocas.
 
 Este archivo SOLO orquesta: lee inputs del usuario, llama al backend
 (src/backend/*) y pinta resultados con los componentes visuales de
@@ -15,6 +16,7 @@ Ejecutar (desde la RAÍZ del proyecto):
 """
 import io
 import sys
+import time
 from pathlib import Path
 
 # --------------------------------------------------------------------
@@ -35,10 +37,11 @@ import torch
 
 from src import config
 from src.backend import body_engine, eeg_engine
-from src.frontend import resources, ui_components
+from src.frontend import resources, session, ui_components
 
 mne.set_log_level("ERROR")
 st.set_page_config(page_title="Monitor de Dolor — XAI EEG", layout="wide")
+session.init_session_state()
 
 BIOVID_LABELS = ["BL1 (sin dolor)", "PA1 (leve)", "PA2 (moderado)", "PA3 (fuerte)", "PA4 (extremo)"]
 
@@ -85,12 +88,17 @@ if fuente is None:
     st.info("Sube o selecciona un archivo en la barra lateral.")
     st.stop()
 
+nombre_archivo = archivo_local or subido.name
+
 # ====================================================================
 # PREPARAR TENSOR + NOMBRES DE CANAL + INFO DE MONTAJE
 # ====================================================================
 ch_names = config.CH_NAMES
 info = None
 tensor = None
+epochs = None
+n_epocas = 0
+idx = 0
 
 es_fif = (
     (subido is not None and subido.name.lower().endswith(".fif")) or
@@ -104,9 +112,47 @@ if es_fif:
         n_epocas = len(epochs)
         st.success(f"`.fif` cargado: {n_epocas} épocas · {len(epochs.ch_names)} canales · "
                   f"{epochs.info['sfreq']:.0f} Hz")
-        idx = st.slider("Época a analizar", 0, max(n_epocas - 1, 0), 0)
-        label_evento = eeg_engine.event_label_para_epoca(epochs, idx) if es_fif else None
-        clase_real = body_engine.clase_biovid_desde_evento(label_evento)
+
+        # ------------------------------------------------------------
+        # Controles de época: reproducción automática vs. manual.
+        # `session.epoca_actual` es la ÚNICA fuente de verdad. El widget
+        # del slider se sincroniza con ella SIEMPRE ANTES de instanciarse
+        # (Streamlit prohíbe escribir session_state[key] de un widget
+        # DESPUÉS de haberlo creado en el mismo run — por eso el tick
+        # automático, al final del script, solo toca `session`, nunca
+        # la clave del widget directamente).
+        # ------------------------------------------------------------
+        if session.get_epoca_actual() >= n_epocas:
+            session.set_epoca_actual(0)
+        if st.session_state.get("slider_epoca_widget") != session.get_epoca_actual():
+            st.session_state["slider_epoca_widget"] = session.get_epoca_actual()
+
+        c_play, c_pause, c_speed = st.columns([1, 1, 2])
+        with c_play:
+            if st.button("▶ Reproducir", use_container_width=True, disabled=session.is_playing()):
+                session.set_playing(True)
+                st.rerun()
+        with c_pause:
+            if st.button("⏸ Pausar", use_container_width=True, disabled=not session.is_playing()):
+                session.set_playing(False)
+                st.rerun()
+        with c_speed:
+            intervalo_seg = st.slider("Segundos entre épocas", 0.5, 5.0, 2.0, step=0.5)
+
+        if session.is_playing():
+            st.info(f"▶ Reproduciendo automáticamente — avanza cada {intervalo_seg:.1f}s. "
+                    f"Mueve el slider para volver a modo manual.")
+
+        idx = st.slider("Época a analizar", 0, max(n_epocas - 1, 0), key="slider_epoca_widget")
+
+        if idx != session.get_epoca_actual():
+            # El usuario arrastró el slider a mano -> pausa el modo automático.
+            # (Un avance por autoplay nunca llega aquí: la sincronización de
+            # arriba ya deja `idx == session.get_epoca_actual()` antes de crear
+            # el widget, así que esta rama solo se dispara por interacción real.)
+            session.set_epoca_actual(idx)
+            session.set_playing(False)
+
         tensor = eeg_engine.epoca_a_tensor(epochs, idx)
         ch_names = epochs.ch_names
         info = eeg_engine.info_con_montaje(epochs)
@@ -114,6 +160,7 @@ if es_fif:
         st.error(f"No pude leer el .fif: {e}")
         st.stop()
 else:
+    session.set_playing(False)  # el modo automático solo aplica a .fif con varias épocas
     try:
         if isinstance(fuente, str):
             tensor = (torch.as_tensor(np.load(fuente), dtype=torch.float32)
@@ -135,18 +182,35 @@ st.markdown("## 🩺 Pain Index (0–10)")
 st.caption("Fusión cuerpo (XGBoost) + cerebro (EEGNet). ⚠️ Emparejamiento **simulado**: "
           "no hay datos multimodales del mismo paciente, así que la señal corporal se elige a mano.")
 
+pi = None
+cuerpo_pred = None
+cerebro_pred = None
+
 try:
     fuser = resources.get_fuser()
     predictor_cuerpo = resources.get_body_predictor()
 except FileNotFoundError as e:
     st.warning(f"Capa de fusión no disponible: {e}")
 else:
+    label_evento = eeg_engine.event_label_para_epoca(epochs, idx) if es_fif else None
+    clase_real = body_engine.clase_biovid_desde_evento(label_evento)
+
     ctrl1, ctrl2 = st.columns(2)
     with ctrl1:
-        clase_lbl = st.selectbox("Señal corporal (simulada)", BIOVID_LABELS, index=3)
-        cid = BIOVID_LABELS.index(clase_lbl)
-        fila_cuerpo = body_engine.fila_representativa(predictor_cuerpo, cid)
-        prob_cuerpo = body_engine.predecir_proba_cuerpo(predictor_cuerpo, fila_cuerpo)
+        if clase_real is not None:
+            cid = clase_real
+            st.success(f"🔗 Pareo real por evento: época {idx} = **{label_evento}** "
+                      f"→ {BIOVID_LABELS[cid]}")
+            fila_cuerpo = body_engine.fila_por_clase(predictor_cuerpo, cid)
+        else:
+            if es_fif:
+                st.info("Esta época no trae etiqueta de evento reconocible — "
+                        "selección manual (modo simulado).")
+            clase_lbl = st.selectbox("Señal corporal (simulada)", BIOVID_LABELS, index=3)
+            cid = BIOVID_LABELS.index(clase_lbl)
+            fila_cuerpo = body_engine.fila_representativa(predictor_cuerpo, cid)
+        resultado_cuerpo = body_engine.procesar_datos_cuerpo(predictor_cuerpo, fila_cuerpo)
+        prob_cuerpo = resultado_cuerpo.probabilidades
     with ctrl2:
         peso_cerebro = st.slider("Peso del cerebro (%)  ·  el resto es cuerpo", 0, 100, 50, step=5,
                                  help="Sube el cerebro si el cuerpo tiene artefactos de movimiento.")
@@ -170,25 +234,50 @@ else:
         st.bar_chart(df_fus, height=220)
         st.caption(f"Score de fusión (esperanza): "
                   f"{float(np.sum(prob_fus * config.CLASES_BIOVID)):.2f} / 4.0")
-        
-    if clase_real is not None:
-        st.success(f"🔗 Pareo real por evento: época {idx} = **{label_evento}** → {BIOVID_LABELS[clase_real]}")
-        cid = clase_real
-        fila_cuerpo = body_engine.fila_por_clase(predictor_cuerpo, cid)
-    else:
-        st.info("Esta época no trae etiqueta de evento — selecciona manualmente (modo simulado).")
-        clase_lbl = st.selectbox("Señal corporal (simulada)", BIOVID_LABELS, index=3)
-        cid = BIOVID_LABELS.index(clase_lbl)
-        fila_cuerpo = body_engine.fila_representativa(predictor_cuerpo, cid)
 
-prob_cuerpo = body_engine.predecir_proba_cuerpo(predictor_cuerpo, fila_cuerpo)
+    # ----------------------------------------------------------------
+    # Explicabilidad de la señal CORPORAL: SHAP (automático, rápido)
+    # + LIME (bajo demanda, más lento — perturba ~500 muestras).
+    # ----------------------------------------------------------------
+    st.markdown("#### 🔍 ¿Por qué esta predicción corporal?")
+    exp_shap, exp_lime = st.columns(2)
+    with exp_shap:
+        st.caption("**SHAP** (TreeExplainer — exacto, automático)")
+        df_shap = pd.DataFrame(resultado_cuerpo.top_drivers).set_index("biomarcador")
+        st.bar_chart(df_shap, height=200)
+    with exp_lime:
+        st.caption("**LIME** (aproximación local — bajo demanda)")
+        if st.button("Calcular explicación LIME", disabled=session.is_playing(),
+                    help=("Deshabilitado en modo reproducción automática por su costo."
+                         if session.is_playing() else None)):
+            with st.spinner("Perturbando muestras alrededor del paciente..."):
+                lime_explainer = resources.get_lime_explainer()
+                top_lime = body_engine.explicar_con_lime(
+                    predictor_cuerpo, lime_explainer, fila_cuerpo, resultado_cuerpo.clase)
+            session.set_resultado_cacheado("lime_cuerpo", idx, top_lime)
+
+        top_lime_cache = session.get_resultado_cacheado("lime_cuerpo", idx)
+        if top_lime_cache is not None:
+            df_lime = pd.DataFrame(top_lime_cache).set_index("biomarcador")
+            st.bar_chart(df_lime, height=200)
+        else:
+            st.caption("Presiona el botón para calcularla (no se ejecuta automáticamente).")
 
 # ====================================================================
 # DETALLE CEREBRAL: predicción + XAI + topomap
 # ====================================================================
 st.markdown("---")
 st.markdown("### 🧠 Detalle del cerebro (EEG + XAI)")
-if not st.button("Analizar EEG en detalle", type="primary"):
+
+modo_automatico = session.is_playing()
+if modo_automatico:
+    session.activar_detalle()
+    st.caption("Modo automático activo: se analiza cada época sin necesidad de presionar el botón.")
+else:
+    if st.button("Analizar EEG en detalle", type="primary"):
+        session.activar_detalle()
+
+if not session.is_detalle_activo():
     st.stop()
 
 try:
@@ -225,3 +314,140 @@ with st.expander("Ver los 63 pesos por electrodo"):
          "Peso (0-1)": [round(float(resultado.pesos_electrodo[i]), 3) for i in orden]},
         use_container_width=True, height=300,
     )
+
+# ----------------------------------------------------------------
+# SHAP-EEG (GradientShap) + Grad-CAM — bajo demanda, como LIME: son
+# 3 pasadas backward adicionales, no conviene correrlas en cada tick
+# del modo reproducción automática.
+# ----------------------------------------------------------------
+st.markdown("#### 🧬 SHAP + Grad-CAM (EEG)")
+st.caption("Complementa a Integrated Gradients con dos métodos adicionales: "
+          "SHAP (GradientShap) por electrodo, y Grad-CAM canal × tiempo "
+          "(capa `temporal_conv`, antes de que la capa espacial colapse los electrodos).")
+
+if st.button("Calcular SHAP + Grad-CAM (EEG)", disabled=session.is_playing(),
+            help=("Deshabilitado en modo reproducción automática por su costo."
+                 if session.is_playing() else None)):
+    with st.spinner("Calculando GradientShap y Grad-CAM..."):
+        xai_ext = eeg_engine.calcular_xai_extendido(tensor, modelo_eeg)
+    session.set_resultado_cacheado("xai_ext_eeg", idx, xai_ext)
+
+xai_ext = session.get_resultado_cacheado("xai_ext_eeg", idx)
+if xai_ext is not None:
+    if xai_ext.clase != resultado.clase:
+        st.warning("⚠️ La clase usada para SHAP/Grad-CAM no coincide con la de Integrated "
+                  "Gradients de arriba — vuelve a analizar la época antes de comparar.")
+
+    comp1, comp2 = st.columns(2)
+    with comp1:
+        st.caption("**Integrated Gradients vs SHAP** por electrodo (top de cada uno)")
+        df_comp = pd.DataFrame({
+            "Integrated Gradients": resultado.pesos_electrodo,
+            "SHAP (GradientShap)": xai_ext.shap_por_canal,
+        }, index=ch_names)
+        top_ig = set(df_comp["Integrated Gradients"].nlargest(10).index)
+        top_shap = set(df_comp["SHAP (GradientShap)"].nlargest(10).index)
+        electrodos_top = [ch for ch in ch_names if ch in (top_ig | top_shap)]
+        st.bar_chart(df_comp.loc[electrodos_top], height=280)
+        coinciden = len(top_ig & top_shap)
+        st.caption(f"Coinciden {coinciden}/10 electrodos entre el top-10 de ambos métodos "
+                  f"— más coincidencia = explicación más robusta, no artefacto de un solo método.")
+    with comp2:
+        st.caption("**Ventana temporal crítica** (Grad-CAM sobre `separable_conv`)")
+        eje_ms = (np.arange(len(xai_ext.gradcam_ventana_temporal)) / config.SFREQ * 1000).round().astype(int)
+        df_tiempo = pd.DataFrame({"Importancia": xai_ext.gradcam_ventana_temporal}, index=eje_ms)
+        st.line_chart(df_tiempo, height=280)
+        st.caption("Eje X en milisegundos desde el inicio de la época.")
+
+    st.pyplot(ui_components.dibujar_gradcam_heatmap(xai_ext.gradcam_canal_tiempo, ch_names),
+              use_container_width=True)
+else:
+    st.caption("Presiona el botón para calcularlo (no se ejecuta automáticamente).")
+
+# ----------------------------------------------------------------
+# LIME-EEG (oclusión) — más barato que SHAP/Grad-CAM (solo forward,
+# sin backward), pero se deja igual bajo botón para mantener el
+# patrón consistente con las otras explicaciones "bajo demanda".
+# ----------------------------------------------------------------
+st.markdown("#### 🧩 LIME-EEG (aproximación por oclusión)")
+st.caption("LIME clásico (tabular) no aplica a una señal continua. Esta es la adaptación "
+          "estándar: ocluye un electrodo o ventana de tiempo a la vez y mide cuánto cae la "
+          "probabilidad de la clase predicha. Es perturbación real sobre el modelo (sin "
+          "gradientes) — tercera validación cruzada, independiente de IG/SHAP/Grad-CAM.")
+
+if st.button("Calcular LIME-EEG (oclusión)"):
+    with st.spinner("Ocluyendo electrodos y ventanas temporales..."):
+        lime_eeg = eeg_engine.calcular_lime_eeg(tensor, modelo_eeg)
+    session.set_resultado_cacheado("lime_eeg", idx, lime_eeg)
+
+lime_eeg = session.get_resultado_cacheado("lime_eeg", idx)
+if lime_eeg is not None:
+    if lime_eeg.clase != resultado.clase:
+        st.warning("⚠️ La clase usada para LIME-EEG no coincide con la de Integrated "
+                  "Gradients de arriba — vuelve a analizar la época antes de comparar.")
+
+    l1, l2 = st.columns(2)
+    with l1:
+        st.caption("**Importancia por electrodo** (caída de probabilidad al ocluir)")
+        df_comp2 = pd.DataFrame({
+            "Integrated Gradients": resultado.pesos_electrodo,
+            "LIME-EEG (oclusión)": lime_eeg.importancia_por_canal,
+        }, index=ch_names)
+        top_lime_eeg = set(df_comp2["LIME-EEG (oclusión)"].nlargest(10).index)
+        top_ig_ahora = set(df_comp2["Integrated Gradients"].nlargest(10).index)
+        electrodos_top2 = [ch for ch in ch_names if ch in (top_lime_eeg | top_ig_ahora)]
+        st.bar_chart(df_comp2.loc[electrodos_top2], height=280)
+        coinciden2 = len(top_lime_eeg & top_ig_ahora)
+        st.caption(f"Coinciden {coinciden2}/10 electrodos con el top-10 de Integrated Gradients.")
+    with l2:
+        st.caption("**Importancia por ventana temporal** (caída de probabilidad al ocluir)")
+        eje_ms2 = (np.arange(len(lime_eeg.importancia_por_tiempo)) / config.SFREQ * 1000).round().astype(int)
+        df_tiempo2 = pd.DataFrame({"Importancia": lime_eeg.importancia_por_tiempo}, index=eje_ms2)
+        st.line_chart(df_tiempo2, height=280)
+        st.caption("Eje X en milisegundos desde el inicio de la época.")
+else:
+    st.caption("Presiona el botón para calcularlo.")
+
+
+# ====================================================================
+# HISTORIAL DE LA SESIÓN
+# ====================================================================
+session.registrar_entrada(
+    archivo=nombre_archivo,
+    epoca=idx if es_fif else -1,
+    pain_index=pi,
+    nivel_eeg=resultado.nivel_dolor,
+    confianza_eeg=resultado.confianza,
+    cuerpo_pred=cuerpo_pred,
+    cerebro_pred=cerebro_pred,
+)
+
+st.markdown("---")
+st.markdown("### 📈 Historial de la sesión")
+df_hist = session.get_historial_df()
+if df_hist.empty or df_hist["pain_index"].isna().all():
+    st.caption("Aún no hay registros con Pain Index en esta sesión.")
+else:
+    st.line_chart(df_hist.dropna(subset=["pain_index"]).set_index("epoca")["pain_index"], height=220)
+    with st.expander("Ver tabla completa del historial"):
+        st.dataframe(df_hist, use_container_width=True, height=250)
+    if st.button("🗑️ Limpiar historial"):
+        session.limpiar_historial()
+        st.rerun()
+
+# ====================================================================
+# TICK DEL MODO AUTOMÁTICO — debe ir al FINAL, después de renderizar
+# y registrar todo. Duerme, avanza la época y fuerza un rerun.
+#
+# IMPORTANTE: acá solo se actualiza `session.epoca_actual` (una clave
+# normal), NUNCA `st.session_state["slider_epoca_widget"]` — ese widget
+# ya fue instanciado en este mismo run, y Streamlit prohíbe escribir la
+# session_state de un widget después de haberlo creado. La sincronización
+# real ocurre al inicio del PRÓXIMO run, antes de crear el slider de nuevo
+# (ver el bloque "Controles de época" más arriba).
+# ====================================================================
+if es_fif and session.is_playing() and n_epocas > 0:
+    time.sleep(intervalo_seg)
+    siguiente = (idx + 1) % n_epocas
+    session.set_epoca_actual(siguiente)
+    st.rerun()

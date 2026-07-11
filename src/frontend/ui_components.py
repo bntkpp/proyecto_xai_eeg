@@ -97,6 +97,28 @@ def dibujar_topomap(pesos_63, info):
     return fig
 
 
+def dibujar_gradcam_heatmap(mapa_canal_tiempo: np.ndarray, ch_names, sfreq: int = config.SFREQ):
+    """Heatmap canal × tiempo de Grad-CAM (capa temporal_conv, ANTES de que
+    spatial_conv colapse los electrodos). Filas = electrodos en su orden
+    real (no alfabético), columnas = tiempo en milisegundos."""
+    n_channels, n_samples = mapa_canal_tiempo.shape
+    tiempos_ms = (np.arange(n_samples) / sfreq) * 1000
+
+    fig, ax = plt.subplots(figsize=(7.5, 6))
+    im = ax.imshow(mapa_canal_tiempo, aspect="auto", cmap="hot",
+                   extent=[tiempos_ms[0], tiempos_ms[-1], n_channels, 0])
+    ax.set_xlabel("Tiempo (ms)")
+    ax.set_ylabel("Electrodo")
+    # Con ~60 electrodos no caben todas las etiquetas legibles: se muestra 1 de cada `paso`.
+    paso = max(1, n_channels // 25)
+    ax.set_yticks(np.arange(0, n_channels, paso) + 0.5)
+    ax.set_yticklabels([ch_names[i] for i in range(0, n_channels, paso)], fontsize=7)
+    fig.colorbar(im, ax=ax, shrink=0.7, label="Importancia Grad-CAM (0-1)")
+    ax.set_title("Grad-CAM: canal × tiempo (capa temporal_conv)", fontsize=11)
+    fig.tight_layout()
+    return fig
+
+
 def guardar_temporal(archivo_subido) -> str:
     """Guarda un archivo subido de Streamlit en un temporal y devuelve su ruta.
 

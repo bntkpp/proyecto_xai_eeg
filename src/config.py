@@ -58,15 +58,6 @@ MAPA_DOLOR = {
     3: "Dolor Severo (NRS 8)",
 }
 
-NRS_LABEL_TO_BIOVID_CLASS = {
-    "NRS_0": 0,   # BL1 - sin dolor (si existe en tus datos)
-    "NRS_2": 1,   # PA1
-    "NRS_4": 2,   # PA2
-    "NRS_6": 3,   # PA3
-    "NRS_8": 4,   # PA4
-}
-
-
 CH_NAMES = [
     "Fp1", "Fpz", "Fp2",
     "AF7", "AF3", "AFz", "AF4", "AF8",
@@ -114,6 +105,17 @@ NRS_POR_CLASE_BIOVID = np.array([0.0, 2.5, 5.0, 7.5, 10.0])
 
 BODY_META_COLS = ["subject_id", "subject_name", "class_id", "class_name",
                   "sample_id", "sample_name"]
+
+# Mapea la etiqueta de evento real del .fif (protocolo de estimulación)
+# a la clase BioVid correspondiente (0=BL1 sin dolor ... 4=PA4 extremo).
+# Confirmado con el usuario: NRS_2/4/6/8 = PA1/PA2/PA3/PA4.
+NRS_LABEL_TO_BIOVID_CLASS = {
+    "NRS_0": 0,   # BL1 - sin dolor (si existe en los datos)
+    "NRS_2": 1,   # PA1
+    "NRS_4": 2,   # PA2
+    "NRS_6": 3,   # PA3
+    "NRS_8": 4,   # PA4
+}
 
 
 # --------------------------------------------------------------------

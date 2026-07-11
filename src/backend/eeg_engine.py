@@ -19,7 +19,7 @@ from typing import Optional, Sequence
 import numpy as np
 import torch
 import torch.nn as nn
-from captum.attr import IntegratedGradients
+from captum.attr import GradientShap, IntegratedGradients, LayerAttribution, LayerGradCam
 
 from src import config
 
@@ -149,6 +149,18 @@ def info_con_montaje(epochs):
     return info
 
 
+def event_label_para_epoca(epochs, idx: int) -> Optional[str]:
+    """Devuelve el nombre del evento real asociado a la época `idx`
+    (ej. 'NRS_6'), leído del propio .fif — NO es una predicción, es la
+    etiqueta del protocolo de estimulación. Devuelve None si el .fif
+    no trae event_id útil."""
+    if not epochs.event_id:
+        return None
+    codigo = epochs.events[idx, 2]
+    inverso = {v: k for k, v in epochs.event_id.items()}
+    return inverso.get(codigo)
+
+
 def build_info(sfreq: int = config.SFREQ):
     """Construye un info de MNE desde CH_NAMES (fuente B: tensores sueltos)."""
     import mne
@@ -242,11 +254,228 @@ def procesar_onda_eeg(tensor_eeg: torch.Tensor, model_cargado: EEGNet,
     return ResultadoEEG(nivel_dolor, pesos_63, explicacion, confianza, clase)
 
 
-def event_label_para_epoca(epochs, idx: int) -> str | None:
-    """Devuelve el nombre del evento (ej. 'NRS_6') asociado a la época `idx`,
-    o None si el .fif no trae event_id útil."""
-    if not epochs.event_id:
-        return None
-    codigo = epochs.events[idx, 2]
-    inverso = {v: k for k, v in epochs.event_id.items()}
-    return inverso.get(codigo)
+# ====================================================================
+# XAI EXTENDIDA — SHAP (GradientShap) + Grad-CAM
+# ====================================================================
+# Todo lo de aquí abajo usa exclusivamente las dimensiones del tensor
+# de entrada (x.shape) y config.SFREQ/N_SAMPLES — NADA hardcodeado a
+# 63 canales. Cuando se reemplace el checkpoint por el de 61 canales
+# (sin VEO/HEOR), esto sigue funcionando sin cambios: basta con
+# actualizar config.N_CHANNELS / config.CH_NAMES.
+
+@dataclass(frozen=True)
+class ResultadoXAIExtendido:
+    """SHAP (GradientShap) + Grad-CAM, complementando a Integrated Gradients
+    (ya calculado en `procesar_onda_eeg`). Se agrupan en una sola llamada
+    para reusar la MISMA clase predicha en los tres métodos — comparar
+    métodos que explican clases distintas no tendría sentido."""
+    clase: int
+    shap_por_canal: np.ndarray            # (n_channels,) normalizado 0-1
+    gradcam_canal_tiempo: np.ndarray      # (n_channels, n_samples) normalizado 0-1
+    gradcam_ventana_temporal: np.ndarray  # (n_samples,) normalizado 0-1
+
+
+def calcular_shap_eeg(tensor_eeg: torch.Tensor, model_cargado: EEGNet,
+                      n_baselines: int = 20, n_samples: int = 25,
+                      clase: Optional[int] = None) -> tuple[np.ndarray, int]:
+    """Aproximación SHAP para EEGNet vía GradientShap (Erion et al. 2021).
+
+    No existe un dataset de fondo de EEG crudo representativo (a diferencia
+    del modelo corporal, que sí lo tiene), así que el 'fondo' se simula con
+    ruido gaussiano alrededor de cero, escalado a la magnitud real de la
+    señal de entrada. Complementa a Integrated Gradients (que usa un único
+    baseline fijo en cero) con una explicación basada en distribución de
+    baselines — son dos aproximaciones distintas al mismo concepto de
+    Shapley values, útiles para comparar consistencia (ver Fase 1.4).
+    """
+    x = _prep_input(tensor_eeg).to(DEVICE)
+    if clase is None:
+        with torch.no_grad():
+            clase = int(model_cargado(x).argmax(dim=1).item())
+
+    escala_ruido = float(x.std()) or 1.0
+    baselines = torch.randn(n_baselines, *x.shape[1:], device=DEVICE) * escala_ruido
+
+    gs = GradientShap(model_cargado)
+    atribuciones = gs.attribute(x, baselines=baselines, target=clase,
+                                n_samples=n_samples, stdevs=0.05)
+    pesos = atribuciones.detach().abs().mean(dim=3).reshape(-1).cpu().numpy()
+
+    rango = float(pesos.max() - pesos.min())
+    pesos = (pesos - pesos.min()) / rango if rango > 0 else np.zeros_like(pesos)
+    return pesos, clase
+
+
+def grad_cam_temporal(tensor_eeg: torch.Tensor, model_cargado: EEGNet,
+                      clase: Optional[int] = None) -> tuple[np.ndarray, int]:
+    """Grad-CAM sobre `temporal_conv` (la PRIMERA capa convolucional).
+
+    Se elige esta capa a propósito: `spatial_conv` (la siguiente) usa un
+    kernel (n_channels, 1) que COLAPSA la dimensión de electrodo a 1 — si
+    se hiciera Grad-CAM después de esa capa, se perdería toda resolución
+    por canal. `temporal_conv` preserva electrodo × tiempo intactos
+    (kernel (1, K) con padding='same'), así que el mapa resultante tiene
+    la resolución completa (n_channels, n_samples) SIN necesidad de
+    interpolar.
+    """
+    x = _prep_input(tensor_eeg).to(DEVICE)
+    if clase is None:
+        with torch.no_grad():
+            clase = int(model_cargado(x).argmax(dim=1).item())
+
+    gc = LayerGradCam(model_cargado, model_cargado.temporal_conv)
+    mapa = gc.attribute(x, target=clase, relu_attributions=True)
+    mapa = mapa.detach().cpu().numpy().reshape(mapa.shape[-2], mapa.shape[-1])  # (n_channels, n_samples)
+
+    pico = float(mapa.max())
+    if pico > 0:
+        mapa = mapa / pico
+    return mapa, clase
+
+
+def grad_cam_ventana_temporal(tensor_eeg: torch.Tensor, model_cargado: EEGNet,
+                              clase: Optional[int] = None) -> tuple[np.ndarray, int]:
+    """Grad-CAM sobre `separable_conv` (capa profunda, tras el pooling).
+
+    Para esta altura de la red, `spatial_conv` YA colapsó los electrodos
+    (dimensión de canal = 1) — este mapa NO tiene resolución por electrodo,
+    solo temporal. Sirve para responder "¿qué ventana de tiempo dentro de
+    la época fue más determinante?" (relevante para 1.4: contrastar contra
+    ventanas esperadas de N2/P300/gamma en la literatura). Como el pooling
+    reduce la resolución temporal (÷32), se interpola de vuelta al largo
+    original de la época para poder graficarlo alineado con los otros XAI.
+    """
+    x = _prep_input(tensor_eeg).to(DEVICE)
+    n_samples = x.shape[-1]
+    if clase is None:
+        with torch.no_grad():
+            clase = int(model_cargado(x).argmax(dim=1).item())
+
+    gc = LayerGradCam(model_cargado, model_cargado.separable_conv)
+    mapa = gc.attribute(x, target=clase, relu_attributions=True)
+    mapa = LayerAttribution.interpolate(mapa, (1, n_samples))
+    serie = mapa.detach().cpu().numpy().reshape(-1)
+
+    pico = float(serie.max())
+    if pico > 0:
+        serie = serie / pico
+    return serie, clase
+
+
+def calcular_xai_extendido(tensor_eeg: torch.Tensor, model_cargado: EEGNet) -> ResultadoXAIExtendido:
+    """Calcula SHAP + los dos Grad-CAM de una sola vez, sobre la MISMA
+    clase predicha (evita comparar explicaciones de clases distintas).
+
+    Es más costoso que Integrated Gradients solo (3 pasadas backward
+    adicionales) — en el frontend se deja gatillado por botón, no
+    automático en cada tick del modo reproducción.
+    """
+    x = _prep_input(tensor_eeg).to(DEVICE)
+    with torch.no_grad():
+        clase = int(model_cargado(x).argmax(dim=1).item())
+
+    shap_canal, _ = calcular_shap_eeg(tensor_eeg, model_cargado, clase=clase)
+    gradcam_ct, _ = grad_cam_temporal(tensor_eeg, model_cargado, clase=clase)
+    gradcam_vt, _ = grad_cam_ventana_temporal(tensor_eeg, model_cargado, clase=clase)
+
+    return ResultadoXAIExtendido(
+        clase=clase,
+        shap_por_canal=shap_canal,
+        gradcam_canal_tiempo=gradcam_ct,
+        gradcam_ventana_temporal=gradcam_vt,
+    )
+
+
+# ====================================================================
+# LIME-EEG — aproximación por OCLUSIÓN
+# ====================================================================
+# LIME clásico (lime.lime_tabular) asume features tabulares discretas e
+# independientes — no aplica a una señal continua electrodo×tiempo. La
+# adaptación estándar (usada en visión e interpretabilidad de señales) es
+# la oclusión: silenciar una parte de la entrada y medir cuánto CAE la
+# probabilidad de la clase predicha. Es perturbación real sobre el
+# modelo (forward puro, sin gradientes) — por eso sirve como validación
+# cruzada independiente de IG/SHAP/Grad-CAM, que sí usan gradientes.
+
+@dataclass(frozen=True)
+class ResultadoLimeEEG:
+    clase: int
+    importancia_por_canal: np.ndarray    # (n_channels,) 0-1
+    importancia_por_tiempo: np.ndarray   # (n_samples,) 0-1
+
+
+def _prob_de_clase(x_batch: torch.Tensor, model_cargado: EEGNet, clase: int) -> np.ndarray:
+    """Probabilidad de `clase` para cada muestra de un batch."""
+    with torch.no_grad():
+        probs = torch.softmax(model_cargado(x_batch) / config.CONF_TEMPERATURE, dim=1)
+    return probs[:, clase].cpu().numpy()
+
+
+def lime_eeg_por_canal(tensor_eeg: torch.Tensor, model_cargado: EEGNet,
+                       clase: Optional[int] = None) -> tuple[np.ndarray, int]:
+    """Ocluye un electrodo a la vez (lo pone en 0) y mide cuánto cae la
+    probabilidad de la clase predicha. Mayor caída = electrodo más
+    importante. Todas las oclusiones se evalúan en UN solo forward
+    batcheado (rápido: no necesita backward, a diferencia de Grad-CAM/SHAP)."""
+    x = _prep_input(tensor_eeg).to(DEVICE)
+    n_channels = x.shape[2]
+    if clase is None:
+        with torch.no_grad():
+            clase = int(model_cargado(x).argmax(dim=1).item())
+
+    prob_base = float(_prob_de_clase(x, model_cargado, clase)[0])
+
+    ocluidos = x.repeat(n_channels, 1, 1, 1)
+    for i in range(n_channels):
+        ocluidos[i, 0, i, :] = 0.0
+
+    prob_ocluida = _prob_de_clase(ocluidos, model_cargado, clase)
+    caida = np.clip(prob_base - prob_ocluida, a_min=0, a_max=None)
+
+    pico = float(caida.max())
+    importancia = caida / pico if pico > 0 else np.zeros_like(caida)
+    return importancia, clase
+
+
+def lime_eeg_por_ventana(tensor_eeg: torch.Tensor, model_cargado: EEGNet,
+                         clase: Optional[int] = None, n_ventanas: int = 15) -> tuple[np.ndarray, int]:
+    """Igual que `lime_eeg_por_canal`, pero ocluyendo bloques de TIEMPO
+    (todos los electrodos a la vez) — da la contraparte temporal."""
+    x = _prep_input(tensor_eeg).to(DEVICE)
+    n_samples = x.shape[-1]
+    if clase is None:
+        with torch.no_grad():
+            clase = int(model_cargado(x).argmax(dim=1).item())
+
+    prob_base = float(_prob_de_clase(x, model_cargado, clase)[0])
+
+    limites = np.linspace(0, n_samples, n_ventanas + 1).astype(int)
+    ocluidos = x.repeat(n_ventanas, 1, 1, 1)
+    for i in range(n_ventanas):
+        ocluidos[i, 0, :, limites[i]:limites[i + 1]] = 0.0
+
+    prob_ocluida = _prob_de_clase(ocluidos, model_cargado, clase)
+    caida = np.clip(prob_base - prob_ocluida, a_min=0, a_max=None)
+    pico = float(caida.max())
+    importancia_ventanas = caida / pico if pico > 0 else np.zeros_like(caida)
+
+    # Expandir de n_ventanas a n_samples para graficar alineado con Grad-CAM/SHAP.
+    serie = np.repeat(importancia_ventanas, np.diff(limites))
+    if len(serie) < n_samples:
+        serie = np.pad(serie, (0, n_samples - len(serie)), mode="edge")
+    elif len(serie) > n_samples:
+        serie = serie[:n_samples]
+    return serie, clase
+
+
+def calcular_lime_eeg(tensor_eeg: torch.Tensor, model_cargado: EEGNet,
+                      n_ventanas: int = 15) -> ResultadoLimeEEG:
+    """Calcula ambas oclusiones (canal + tiempo) sobre la MISMA clase predicha."""
+    x = _prep_input(tensor_eeg).to(DEVICE)
+    with torch.no_grad():
+        clase = int(model_cargado(x).argmax(dim=1).item())
+
+    canal, _ = lime_eeg_por_canal(tensor_eeg, model_cargado, clase=clase)
+    tiempo, _ = lime_eeg_por_ventana(tensor_eeg, model_cargado, clase=clase, n_ventanas=n_ventanas)
+
+    return ResultadoLimeEEG(clase=clase, importancia_por_canal=canal, importancia_por_tiempo=tiempo)

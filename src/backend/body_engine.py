@@ -12,11 +12,13 @@ estructurados (dataclasses), no HTML ni nada de presentación.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 import shap
 import xgboost as xgb
+from lime.lime_tabular import LimeTabularExplainer
 
 from src import config
 
@@ -70,13 +72,36 @@ def cargar_predictor_corporal(
 
 
 def fila_representativa(predictor: PredictorCorporal, clase: int) -> pd.DataFrame:
-    """Fila de ejemplo del dataset para una clase BioVid (0-4).
+    """Fila de ejemplo (fija) del dataset para una clase BioVid (0-4).
 
-    Se usa para SIMULAR una señal corporal en el dashboard: hoy no hay
-    datos multimodales reales del mismo paciente (cuerpo + cerebro a
-    la vez), así que el clínico elige la clase a mano.
+    Se usa para SIMULAR una señal corporal cuando NO hay pareo real
+    disponible (ver `clase_biovid_desde_evento`): el clínico elige la
+    clase a mano porque no hay datos multimodales reales del mismo
+    paciente (cuerpo + cerebro a la vez).
     """
     idx = int(predictor.dataset.index[predictor.dataset["class_id"] == clase][0])
+    return predictor.dataset[predictor.features].iloc[[idx]]
+
+
+def clase_biovid_desde_evento(label: Optional[str]) -> Optional[int]:
+    """Traduce la etiqueta de evento REAL del .fif (ej. 'NRS_6') a la
+    clase BioVid correspondiente, usando config.NRS_LABEL_TO_BIOVID_CLASS.
+    Devuelve None si no hay etiqueta o no está en el mapeo (cae a modo
+    manual/simulado en el frontend)."""
+    if label is None:
+        return None
+    return config.NRS_LABEL_TO_BIOVID_CLASS.get(label)
+
+
+def fila_por_clase(predictor: PredictorCorporal, clase: int, rng=None) -> pd.DataFrame:
+    """Como `fila_representativa`, pero elige una fila AL AZAR dentro de
+    esa clase — se usa en el pareo REAL por evento, para no repetir
+    siempre el mismo paciente corporal en cada época con la misma clase."""
+    filas_clase = predictor.dataset.index[predictor.dataset["class_id"] == clase]
+    if len(filas_clase) == 0:
+        raise ValueError(f"No hay filas con class_id={clase} en el dataset corporal.")
+    rng = rng or np.random.default_rng()
+    idx = int(rng.choice(filas_clase))
     return predictor.dataset[predictor.features].iloc[[idx]]
 
 
@@ -113,16 +138,49 @@ def procesar_datos_cuerpo(predictor: PredictorCorporal, fila_paciente: pd.DataFr
     )
 
 
+# ====================================================================
+# LIME — explicaciones locales (complemento/validación cruzada de SHAP)
+# ====================================================================
+def crear_explicador_lime(predictor: PredictorCorporal) -> LimeTabularExplainer:
+    """Construye el explicador LIME sobre el dataset de fondo.
 
-def clase_biovid_desde_evento(label: str | None) -> int | None:
-    """Traduce 'NRS_6' -> 3 (PA3). None si no hay match."""
-    if label is None:
-        return None
-    return config.NRS_LABEL_TO_BIOVID_CLASS.get(label)
+    Es relativamente costoso de construir (calcula estadísticas de
+    discretización sobre todo el dataset), por eso se cachea a nivel
+    de recurso en el frontend (`resources.get_lime_explainer`) — se
+    crea UNA sola vez, no en cada época.
+    """
+    return LimeTabularExplainer(
+        training_data=predictor.dataset[predictor.features].values,
+        feature_names=predictor.features,
+        class_names=[MAPA_DOLOR_CUERPO[i] for i in range(5)],
+        mode="classification",
+        discretize_continuous=True,
+    )
 
 
+def explicar_con_lime(predictor: PredictorCorporal, explainer: LimeTabularExplainer,
+                      fila_paciente: pd.DataFrame, clase: int,
+                      num_features: int = 5, num_samples: int = 500) -> list[dict]:
+    """Explicación local LIME para UNA fila de biomarcadores.
 
-def fila_por_clase(predictor: PredictorCorporal, clase: int, rng=None) -> pd.DataFrame:
-    filas_clase = predictor.dataset.index[predictor.dataset["class_id"] == clase]
-    idx = (rng or np.random.default_rng()).choice(filas_clase)
-    return predictor.dataset[predictor.features].iloc[[idx]]
+    A diferencia de SHAP (TreeExplainer, cálculo exacto y rápido),
+    LIME perturba `num_samples` muestras sintéticas alrededor de la
+    fila y ajusta un modelo lineal local — es más lento, por eso
+    `num_samples` se mantiene bajo (500) para uso interactivo, y en
+    el frontend se calcula bajo demanda (botón), no automáticamente
+    en cada época.
+    """
+    fila = fila_paciente[predictor.features]
+
+    def predict_fn(x: np.ndarray) -> np.ndarray:
+        # LIME entrega arrays numpy sin nombres de columna; se los
+        # devolvemos como DataFrame para que XGBoost use el orden correcto.
+        return predictor.modelo.predict_proba(pd.DataFrame(x, columns=predictor.features))
+
+    explicacion = explainer.explain_instance(
+        fila.values[0], predict_fn,
+        num_features=num_features, num_samples=num_samples,
+        labels=[clase],
+    )
+    pares = explicacion.as_list(label=clase)
+    return [{"biomarcador": desc, "peso_lime": round(float(peso), 4)} for desc, peso in pares]
