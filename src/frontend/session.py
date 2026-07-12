@@ -24,6 +24,9 @@ _HISTORIAL_KEY = "historial_pain_index"
 _PLAYING_KEY = "reproduccion_automatica"
 _EPOCA_KEY = "epoca_actual"
 _DETALLE_KEY = "detalle_eeg_visible"
+_UMBRAL_ALERTA_KEY = "umbral_alerta_pi"
+
+_UMBRAL_ALERTA_DEFAULT = 7.0
 
 _COLUMNAS_HISTORIAL = [
     "timestamp", "archivo", "epoca", "pain_index",
@@ -38,6 +41,7 @@ def init_session_state() -> None:
     st.session_state.setdefault(_PLAYING_KEY, False)
     st.session_state.setdefault(_EPOCA_KEY, 0)
     st.session_state.setdefault(_DETALLE_KEY, False)
+    st.session_state.setdefault(_UMBRAL_ALERTA_KEY, _UMBRAL_ALERTA_DEFAULT)
 
 
 # ---- Modo de reproducción ------------------------------------------
@@ -99,7 +103,16 @@ def registrar_entrada(*, archivo: str, epoca: int, pain_index: Optional[float],
                       nivel_eeg: str, confianza_eeg: float,
                       cuerpo_pred: Optional[str] = None,
                       cerebro_pred: Optional[str] = None) -> None:
-    """Agrega una fila al historial de la sesión actual."""
+    """Agrega una fila al historial — o la ACTUALIZA si ya existe una para
+    la misma (archivo, época).
+
+    Streamlit re-ejecuta el script completo ante CUALQUIER interacción
+    (mover el slider de fusión, abrir un expander, tocar el selector de
+    señal corporal), no solo al cambiar de época. Sin esta deduplicación,
+    cada una de esas interacciones agregaría una fila nueva para la MISMA
+    época, ensuciando el historial y el gráfico con puntos duplicados.
+    """
+    historial = st.session_state[_HISTORIAL_KEY]
     entrada = {
         "timestamp": datetime.now().strftime("%H:%M:%S"),
         "archivo": archivo,
@@ -110,7 +123,11 @@ def registrar_entrada(*, archivo: str, epoca: int, pain_index: Optional[float],
         "cuerpo_pred": cuerpo_pred,
         "cerebro_pred": cerebro_pred,
     }
-    st.session_state[_HISTORIAL_KEY].append(entrada)
+    for i, existente in enumerate(historial):
+        if existente["archivo"] == archivo and existente["epoca"] == epoca:
+            historial[i] = entrada
+            return
+    historial.append(entrada)
 
 
 def get_historial_df() -> pd.DataFrame:
@@ -122,3 +139,30 @@ def get_historial_df() -> pd.DataFrame:
 
 def limpiar_historial() -> None:
     st.session_state[_HISTORIAL_KEY] = []
+
+
+# ---- Alertas configurables (Fase 3.4) ---------------------------------
+
+def get_umbral_alerta() -> float:
+    return float(st.session_state.get(_UMBRAL_ALERTA_KEY, _UMBRAL_ALERTA_DEFAULT))
+
+
+def set_umbral_alerta(valor: float) -> None:
+    st.session_state[_UMBRAL_ALERTA_KEY] = float(valor)
+
+
+def racha_sobre_umbral(umbral: float) -> int:
+    """Cuenta cuántas entradas CONSECUTIVAS más recientes del historial
+    de esta sesión tienen pain_index >= umbral (se corta en la primera
+    que no cumpla o no tenga Pain Index calculado). Sirve para distinguir
+    un pico puntual de dolor sostenido en el tiempo."""
+    df = get_historial_df()
+    if df.empty:
+        return 0
+    racha = 0
+    for valor in reversed(df["pain_index"].tolist()):
+        if valor is not None and valor >= umbral:
+            racha += 1
+        else:
+            break
+    return racha

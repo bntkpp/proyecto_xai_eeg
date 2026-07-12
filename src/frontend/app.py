@@ -17,6 +17,7 @@ Ejecutar (desde la RAÍZ del proyecto):
 import io
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 # --------------------------------------------------------------------
@@ -36,7 +37,7 @@ import streamlit as st
 import torch
 
 from src import config
-from src.backend import body_engine, coherencia_engine, eeg_engine
+from src.backend import body_engine, coherencia_engine, eeg_engine, narrativa_engine, reportes_engine
 from src.frontend import resources, session, ui_components
 
 mne.set_log_level("ERROR")
@@ -73,6 +74,16 @@ with st.sidebar:
             sel = st.selectbox("...o elige de data/", ["(ninguno)"] + sorted(opciones))
             if sel != "(ninguno)":
                 archivo_local = str(config.DATA_DIR / sel)
+
+    st.markdown("---")
+    st.header("🚨 Alertas")
+    umbral_alerta = st.slider(
+        "Umbral de Pain Index para alerta", 0.0, 10.0,
+        session.get_umbral_alerta(), step=0.5,
+        help="Cuando el Pain Index calculado alcance o supere este valor, "
+             "el dashboard mostrará una alerta de intervención analgésica.",
+    )
+    session.set_umbral_alerta(umbral_alerta)
 
 # ====================================================================
 # CARGA DEL MODELO EEG (falla duro y visible si no está el .pth)
@@ -185,6 +196,7 @@ st.caption("Fusión cuerpo (XGBoost) + cerebro (EEGNet). ⚠️ Emparejamiento *
 pi = None
 cuerpo_pred = None
 cerebro_pred = None
+resultado_cuerpo = None
 
 try:
     fuser = resources.get_fuser()
@@ -201,7 +213,14 @@ else:
             cid = clase_real
             st.success(f"🔗 Pareo real por evento: época {idx} = **{label_evento}** "
                       f"→ {BIOVID_LABELS[cid]}")
-            fila_cuerpo = body_engine.fila_por_clase(predictor_cuerpo, cid)
+            # `fila_por_clase` elige una fila AL AZAR dentro de la clase — sin
+            # cachearla por época, cada rerun (mover cualquier otro control,
+            # incluso uno que no toca la época) sortearía una fila distinta y
+            # el Pain Index "saltaría" para la misma época (bug reportado).
+            fila_cuerpo = session.get_resultado_cacheado("fila_cuerpo_real", idx)
+            if fila_cuerpo is None:
+                fila_cuerpo = body_engine.fila_por_clase(predictor_cuerpo, cid)
+                session.set_resultado_cacheado("fila_cuerpo_real", idx, fila_cuerpo)
         else:
             if es_fif:
                 st.info("Esta época no trae etiqueta de evento reconocible — "
@@ -227,6 +246,11 @@ else:
     with gc2:
         st.markdown(ui_components.tarjeta_gauge(pi, w_c, w_b, cuerpo_pred, cerebro_pred),
                     unsafe_allow_html=True)
+
+    if pi >= session.get_umbral_alerta():
+        st.error(f"🚨 **Alerta de intervención analgésica** — Pain Index actual **{pi:.1f}** "
+                f"alcanza o supera el umbral configurado (**{session.get_umbral_alerta():.1f}**). "
+                f"Ajustable en la barra lateral.")
 
     with st.expander("Ver distribución fusionada y score (detalle)"):
         df_fus = pd.DataFrame({"Probabilidad fusionada": prob_fus},
@@ -469,6 +493,26 @@ else:
     else:
         st.caption("Presiona el botón para evaluar la coherencia.")
 
+# ====================================================================
+# PANEL DE EXPLICACIÓN NARRATIVA (Fase 3.5)
+# ====================================================================
+st.markdown("---")
+st.markdown("### 💬 Explicación en lenguaje natural")
+
+xai_ext_actual = session.get_resultado_cacheado("xai_ext_eeg", idx)
+coherencia_actual = session.get_resultado_cacheado("coherencia", idx)
+
+explicacion = narrativa_engine.generar_explicacion(
+    pi=pi, resultado_eeg=resultado, ch_names=ch_names,
+    resultado_cuerpo=resultado_cuerpo, xai_ext=xai_ext_actual, coherencia=coherencia_actual,
+)
+st.markdown(explicacion.texto)
+if explicacion.nivel_detalle != "coherencia":
+    st.caption("💡 Esta explicación mejora automáticamente a medida que calculas más secciones "
+              "arriba (SHAP+Grad-CAM, LIME-EEG, coherencia) para esta misma época.")
+
+
+
 
 
 # ====================================================================
@@ -490,9 +534,31 @@ df_hist = session.get_historial_df()
 if df_hist.empty or df_hist["pain_index"].isna().all():
     st.caption("Aún no hay registros con Pain Index en esta sesión.")
 else:
+    racha = session.racha_sobre_umbral(session.get_umbral_alerta())
+    if racha >= 2:
+        st.warning(f"⏱️ Pain Index sostenido **≥ {session.get_umbral_alerta():.1f}** durante "
+                  f"**{racha} épocas consecutivas** — a diferencia de un pico puntual, esto "
+                  f"sugiere dolor persistente, no un artefacto momentáneo.")
     st.line_chart(df_hist.dropna(subset=["pain_index"]).set_index("epoca")["pain_index"], height=220)
     with st.expander("Ver tabla completa del historial"):
         st.dataframe(df_hist, use_container_width=True, height=250)
+
+    st.markdown("#### 📄 Exportar reporte del turno")
+    rep_c1, rep_c2, rep_c3 = st.columns([1, 1, 2])
+    marca_tiempo = datetime.now().strftime("%Y%m%d_%H%M%S")
+    with rep_c1:
+        st.download_button(
+            "⬇️ Descargar CSV", data=reportes_engine.generar_csv_bytes(df_hist),
+            file_name=f"historial_pain_index_{marca_tiempo}.csv", mime="text/csv",
+        )
+    with rep_c2:
+        st.download_button(
+            "⬇️ Descargar PDF",
+            data=reportes_engine.generar_pdf_bytes(
+                df_hist, nombre_turno=nombre_archivo, umbral_alerta=session.get_umbral_alerta()),
+            file_name=f"reporte_turno_{marca_tiempo}.pdf", mime="application/pdf",
+        )
+
     if st.button("🗑️ Limpiar historial"):
         session.limpiar_historial()
         st.rerun()
