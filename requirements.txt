@@ -1,20 +1,13 @@
 # Hito 4 / Actividad 3 — XAI y Mapeo Cerebral
-# + Hito V — Fusión Multimodal (Pain Index) y explicabilidad (SHAP + LIME)
 # Instala con:  pip install -r requirements.txt
 torch>=2.0
 captum>=0.6.0
 mne>=1.5.0
 streamlit>=1.30
 numpy>=1.24
-scipy>=1.10
-pandas>=2.0
 matplotlib>=3.7
 xgboost>=2.0
 shap>=0.50
-lime>=0.2.0.1
-scikit-learn>=1.3
-joblib>=1.3
-reportlab>=4.0
 fastapi>=0.100
 uvicorn>=0.23
 httpx>=0.24
