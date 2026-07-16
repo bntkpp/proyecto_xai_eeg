@@ -1,61 +1,38 @@
-# ===== Entornos virtuales =====
+# ==========================================
+# Entornos virtuales
+# ==========================================
 .venv/
 venv/
 env/
-ENV/
 
-# ===== Caché de Python =====
+# ==========================================
+# Archivos de caché y compilación de Python
+# ==========================================
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
-.Python
 
-# ===== Modelo (pesado, no va al repo) =====
-*.pth
-*.pt
-*.ckpt
-*.onnx
+# ==========================================
+# Variables de entorno y secretos
+# ==========================================
+.env
+.env.local
 
-# ===== Datos del paciente (EEG / sensibles, NO subir) =====
-data/*.fif
-data/*.npy
-data/*.edf
-data/*.set
-data/*.fdt
-data/*.bdf
-# ...pero conserva el LEEME que explica qué va en data/
-!data/LEEME.txt
+# ==========================================
+# Datos y Modelos (¡NO SUBIR A REPOSITORIOS!)
+# ==========================================
+data/
+models/
 
-# ===== Streamlit =====
-.streamlit/secrets.toml
-
-# ===== Notebooks / Jupyter =====
-.ipynb_checkpoints/
-
-# ===== Salidas y temporales =====
-*.log
-*.tmp
-outputs/
-results/
-figures/
-*.png
-*.jpg
-*.pdf
-
-# ===== Herramientas / tests =====
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
-
-# ===== Editores / IDE =====
-.vscode/
-.idea/
-*.swp
-
-# ===== Sistema operativo =====
+# ==========================================
+# Archivos del Sistema Operativo
+# ==========================================
 .DS_Store
 Thumbs.db
-desktop.ini
+ehthumbs.db
+
+# ==========================================
+# Jupyter Notebooks (Puntos de control)
+# ==========================================
+.ipynb_checkpoints
